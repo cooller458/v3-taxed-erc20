@@ -483,7 +483,6 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
 
         // Fee exclusions
         _isExcludedFromFees[address(this)] = true;
-        _isExcludedFromFees[address(swapRouter)] = true;
         _isExcludedFromFees[address(positionManager)] = true;
         _isExcludedFromFees[owner()] = true;
         _isExcludedFromFees[address(0xdead)] = true;
@@ -568,13 +567,22 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
 
     // Check if an address is any V3 pool
     function isAnyV3Pool(address account) public view returns (bool) {
-        // Check common fee tiers
+        // First check manually added pools
         uint24[4] memory fees = [uint24(100), uint24(500), uint24(3000), uint24(10000)];
         for (uint i = 0; i < fees.length; i++) {
             if (_isV3Pool[account][fees[i]]) {
                 return true;
             }
         }
+        
+        // Then check actual V3 pools via factory
+        for (uint i = 0; i < fees.length; i++) {
+            address poolAddress = uniswapV3Factory.getPool(address(this), WETH9, fees[i]);
+            if (poolAddress == account && poolAddress != address(0)) {
+                return true;
+            }
+        }
+        
         return false;
     }
 
@@ -614,6 +622,31 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
 
     function isContract(address account) internal view returns (bool) {
         return account.code.length > 0;
+    }
+    
+    // Debug functions
+    function checkPoolStatus(address account) external view returns (bool isPool, bool isExcluded, address[] memory activePools) {
+        isPool = isAnyV3Pool(account);
+        isExcluded = _isExcludedFromFees[account];
+        
+        // Get active pools
+        uint24[4] memory fees = [uint24(100), uint24(500), uint24(3000), uint24(10000)];
+        address[] memory pools = new address[](4);
+        uint256 activeCount = 0;
+        
+        for (uint i = 0; i < fees.length; i++) {
+            address poolAddress = uniswapV3Factory.getPool(address(this), WETH9, fees[i]);
+            if (poolAddress != address(0)) {
+                pools[activeCount] = poolAddress;
+                activeCount++;
+            }
+        }
+        
+        // Resize array
+        activePools = new address[](activeCount);
+        for (uint i = 0; i < activeCount; i++) {
+            activePools[i] = pools[i];
+        }
     }
 
     // Transfer function with V3 tax logic
@@ -660,6 +693,12 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
                 liquidityTax = (liquidityFeeSell * amount) / denominator;
                 marketingTax = (marketingTaxSell * amount) / denominator;
             }
+            // Check if from/to is SwapRouter (V3 trading)
+            else if (from == address(swapRouter) || to == address(swapRouter)) {
+                // This is a V3 trade via router, apply buy/sell tax
+                liquidityTax = (liquidityFeeBuy * amount) / denominator;
+                marketingTax = (marketingTaxBuy * amount) / denominator;
+            }
             // Regular transfer
             else {
                 liquidityTax = (liquidityFeeTransfer * amount) / denominator;
@@ -695,18 +734,29 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
         if (contractTokenBalance > 0) {
             _approve(address(this), address(swapRouter), contractTokenBalance);
             
-            ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-                tokenIn: address(this),
-                tokenOut: WETH9,
-                fee: 3000, // 0.3% fee tier
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountIn: contractTokenBalance,
-                amountOutMinimum: 0,
-                sqrtPriceLimitX96: 0
-            });
-
-            try swapRouter.exactInputSingle(params) {} catch {}
+            // Çoklu fee tier deneme sistemi (0.01% öncelikli)
+            uint24[4] memory fees = [uint24(100), uint24(500), uint24(3000), uint24(10000)];
+            bool swapSuccess = false;
+            
+            for (uint i = 0; i < fees.length && !swapSuccess; i++) {
+                address poolAddress = uniswapV3Factory.getPool(address(this), WETH9, fees[i]);
+                if (poolAddress != address(0)) {
+                    try swapRouter.exactInputSingle(
+                        ISwapRouter.ExactInputSingleParams({
+                            tokenIn: address(this),
+                            tokenOut: WETH9,
+                            fee: fees[i],
+                            recipient: address(this),
+                            deadline: block.timestamp,
+                            amountIn: contractTokenBalance,
+                            amountOutMinimum: 0,
+                            sqrtPriceLimitX96: 0
+                        })
+                    ) {
+                        swapSuccess = true;
+                    } catch {}
+                }
+            }
         }
 
         uint256 newBalance = address(this).balance;
@@ -722,18 +772,31 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
         _approve(address(this), address(swapRouter), half);
         uint256 initialBalance = address(this).balance;
         
-        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-            tokenIn: address(this),
-            tokenOut: WETH9,
-            fee: 3000,
-            recipient: address(this),
-            deadline: block.timestamp,
-            amountIn: half,
-            amountOutMinimum: 0,
-            sqrtPriceLimitX96: 0
-        });
-
-        try swapRouter.exactInputSingle(params) {} catch {}
+        // Çoklu fee tier deneme sistemi (0.01% öncelikli)
+        uint24[4] memory fees = [uint24(100), uint24(500), uint24(3000), uint24(10000)];
+        bool swapSuccess = false;
+        uint24 usedFee = 100; // Default 0.01% fee
+        
+        for (uint i = 0; i < fees.length && !swapSuccess; i++) {
+            address poolAddress = uniswapV3Factory.getPool(address(this), WETH9, fees[i]);
+            if (poolAddress != address(0)) {
+                try swapRouter.exactInputSingle(
+                    ISwapRouter.ExactInputSingleParams({
+                        tokenIn: address(this),
+                        tokenOut: WETH9,
+                        fee: fees[i],
+                        recipient: address(this),
+                        deadline: block.timestamp,
+                        amountIn: half,
+                        amountOutMinimum: 0,
+                        sqrtPriceLimitX96: 0
+                    })
+                ) {
+                    swapSuccess = true;
+                    usedFee = fees[i];
+                } catch {}
+            }
+        }
         
         uint256 newBalance = address(this).balance - initialBalance;
         
@@ -760,10 +823,11 @@ contract CREPE_V3 is ERC20, Ownable, ReentrancyGuard {
             }
             
             // Geniş tick range kullanıyoruz (-887272 to 887272 = tam range)
+            // Swap'ta kullanılan fee tier ile aynı fee tier'da liquidity ekle
             INonfungiblePositionManager.MintParams memory mintParams = INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
-                fee: 3000,
+                fee: usedFee, // Swap'ta kullanılan fee tier
                 tickLower: -887272, // MIN_TICK
                 tickUpper: 887272,  // MAX_TICK
                 amount0Desired: amount0Desired,
